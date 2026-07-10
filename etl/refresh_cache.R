@@ -8,7 +8,13 @@
 
 source("R/data_pipeline.R")
 
-current_season <- lubridate::year(Sys.Date())
+# nflreadr::get_current_season() follows nflverse's own Labor Day cutover
+# (not just the calendar year), so this stays correct across the Jan-Aug
+# off-season instead of pointing at a not-yet-played season. Rosters use the
+# separate mid-March free-agency cutover, since teams build next season's
+# roster before that season's games begin.
+current_season <- nflreadr::get_current_season()
+current_roster_season <- nflreadr::get_current_season(roster = TRUE)
 history_seasons <- 1999:current_season
 recent_seasons <- (current_season - 5):current_season
 
@@ -21,8 +27,13 @@ get_team_stats_cached(current_season, force_refresh = TRUE)
 cat("Refreshing player stats (", min(history_seasons), "-", max(history_seasons), ")...\n")
 get_player_stats_cached(history_seasons, force_refresh = TRUE)
 
-cat("Refreshing rosters (current season)...\n")
+cat("Refreshing rosters (current stats season)...\n")
 get_rosters_cached(current_season, force_refresh = TRUE)
+
+if (current_roster_season != current_season) {
+  cat("Refreshing rosters (current roster season)...\n")
+  get_rosters_cached(current_roster_season, force_refresh = TRUE)
+}
 
 cat("Refreshing snap counts (", min(recent_seasons), "-", max(recent_seasons), ")...\n")
 get_snap_counts_cached(recent_seasons, force_refresh = TRUE)

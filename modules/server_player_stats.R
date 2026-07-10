@@ -5,11 +5,13 @@ output$player_stats_table <- DT::renderDataTable({
   # Make sure a player is selected before running the rest of the code
   req(selected_player())
 
-  # Load player stats for all seasons from 1999 through the current year.
-  # Served from data_cache/ (see R/data_pipeline.R) instead of hitting
-  # nflverse on every session.
+  # Load player stats for all seasons from 1999 through the current season.
+  # get_current_season() follows nflverse's own Labor Day cutover rather
+  # than the calendar year, so this doesn't request a season that doesn't
+  # have any data yet during the off-season. Served from data_cache/ (see
+  # R/data_pipeline.R) instead of hitting nflverse on every session.
   stats <- get_player_stats_cached(
-    seasons = 1999:lubridate::year(Sys.Date())
+    seasons = 1999:nflreadr::get_current_season()
   )
 
   # Filter the stats to include only rows for the selected player

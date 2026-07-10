@@ -59,11 +59,20 @@ server <- function(input, output, session) {
   })
 
   # --- Load NFL Data ---
+  # Auto-detects the season instead of a hardcoded year, so this doesn't
+  # need a code change every year. current_season follows nflverse's own
+  # Labor Day cutover (the season with games being played/most recently
+  # completed); current_roster_season follows the mid-March free agency
+  # cutover, since teams start building next season's roster well before
+  # that season's games begin.
+  current_season <- nflreadr::get_current_season()
+  current_roster_season <- nflreadr::get_current_season(roster = TRUE)
+
   # Reads from data_cache/ (populated by etl/refresh_cache.R) instead of
   # hitting nflverse on every session start. See R/data_pipeline.R.
-  sched_all <- get_schedules_cached(seasons = 2025) %>%
+  sched_all <- get_schedules_cached(seasons = current_season) %>%
     distinct(game_id, .keep_all = TRUE)
-  team_stats_all <- get_team_stats_cached(seasons = 2025)
+  team_stats_all <- get_team_stats_cached(seasons = current_season)
 
   # Opponent-adjusted offense/defense ratings (R/opponent_adjustment.R),
   # replacing the old raw-average team_summary which conflated a team's
@@ -265,7 +274,7 @@ server <- function(input, output, session) {
   matchup_choices <- reactive({
     req(input$prop_week)
     sched_all %>%
-      filter(season == 2025, game_type == "REG", week == input$prop_week) %>%
+      filter(season == current_season, game_type == "REG", week == input$prop_week) %>%
       mutate(label = paste(away_team, "vs", home_team)) %>%
       select(game_id, label)
   })
@@ -298,7 +307,7 @@ server <- function(input, output, session) {
     away_team <- selected_game$away_team[1]
 
     # Load current rosters (Item 1: served from data_cache/, not live network)
-    current_rosters <- get_rosters_cached(seasons = 2025)
+    current_rosters <- get_rosters_cached(seasons = current_season)
 
     # Get current rosters for both teams
     home_players <- current_rosters %>%
@@ -316,7 +325,7 @@ server <- function(input, output, session) {
     }
 
     # Get recent stats for trend analysis
-    recent_stats <- get_player_stats_cached(seasons = 2025) %>%
+    recent_stats <- get_player_stats_cached(seasons = current_season) %>%
       filter(week <= week_num, week >= max(1, week_num - 3)) %>%
       select(player_name, position, passing_yards, rushing_yards, receiving_yards, receptions,
              passing_tds, rushing_tds, receiving_tds)
@@ -326,7 +335,7 @@ server <- function(input, output, session) {
     # tryCatch so an unexpected schema/network hiccup degrades to "no
     # adjustment" rather than breaking the whole props table.
     injury_status <- tryCatch({
-      get_injuries_cached(seasons = 2025) %>%
+      get_injuries_cached(seasons = current_season) %>%
         filter(week == week_num) %>%
         select(player_name = full_name, team, report_status) %>%
         distinct(player_name, team, .keep_all = TRUE)
@@ -337,7 +346,7 @@ server <- function(input, output, session) {
     # Item 2: Next Gen Stats completion % above expectation refines the QB
     # yardage projection beyond a raw box-score average.
     qb_cpoe <- tryCatch({
-      get_nextgen_stats_cached(seasons = 2025, stat_type = "passing") %>%
+      get_nextgen_stats_cached(seasons = current_season, stat_type = "passing") %>%
         filter(week <= week_num, week >= max(1, week_num - 3)) %>%
         group_by(player_name = player_display_name) %>%
         summarise(avg_cpoe = mean(completion_percentage_above_expectation, na.rm = TRUE), .groups = "drop")
@@ -465,14 +474,15 @@ server <- function(input, output, session) {
   # per week-selection (once for matchup choices, once for trend content);
   # routing it through the cache (Item 1) means only the first call per
   # cache lifetime actually hits the network.
-  load_trends_data <- function(seasons = 2020:2025) {
+  load_trends_data <- function(seasons = (current_season - 5):current_season) {
     tryCatch({
-      # Load historical data for trend analysis (2020-2025)
+      # Load historical data for trend analysis (last 5 seasons through the
+      # current one)
       player_stats <- get_player_stats_cached(seasons = seasons)
       schedules <- get_schedules_cached(seasons = seasons)
 
-      # Load 2025 rosters for current season
-      rosters <- get_rosters_cached(seasons = 2025)
+      # Load rosters for the current season
+      rosters <- get_rosters_cached(seasons = current_season)
       
       # Get unique player info from rosters
       roster_info <- rosters %>%
@@ -635,9 +645,9 @@ server <- function(input, output, session) {
       return(data.frame())
     }
     
-    # Get 2025 schedule data
+    # Get current-season schedule data
     current_schedule <- trends_data$schedules %>%
-      filter(season == 2025, week == !!week) %>%
+      filter(season == current_season, week == !!week) %>%
       select(game_id, home_team, away_team, week, season)
     
     if (nrow(current_schedule) == 0) {
@@ -740,9 +750,9 @@ server <- function(input, output, session) {
       return(list("All Games" = "all"))
     }
     
-    # Get real 2025 schedule for the specified week
+    # Get the current-season schedule for the specified week
     week_games <- trends_data$schedules %>%
-      filter(season == 2025, week == !!week) %>%
+      filter(season == current_season, week == !!week) %>%
       select(home_team, away_team, game_id)
     
     if (nrow(week_games) == 0) {
@@ -892,7 +902,10 @@ server <- function(input, output, session) {
   })
 
   observe({
-    rosters <- get_rosters_cached(seasons = 2025)
+    # Uses the roster season (mid-March cutover), not the stats season --
+    # players should be clickable as soon as they're on a current roster,
+    # even before that season's games have started.
+    rosters <- get_rosters_cached(seasons = current_roster_season)
     lapply(rosters$gsis_id, function(pid) {
       observeEvent(input[[paste0("player_", pid)]], {
         selected_player(pid)
