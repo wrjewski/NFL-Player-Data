@@ -88,6 +88,24 @@ shiny::runApp("path/to/NFL-Player-Data")
 
 replace path/to with the actual folder path on your machine
 
+### ✅ 3. (Optional) Pre-populate the Data Cache
+
+The app reads NFL data from a local `data_cache/` folder instead of hitting nflverse on every launch. Populate/refresh it with:
+
+```bash
+Rscript etl/refresh_cache.R
+```
+
+Run this once, then again periodically (e.g. daily during the season) to keep the cache fresh. If `data_cache/` is empty, the app will fetch live on first use and cache the result automatically — this script just lets you refresh it out-of-band instead of paying that cost mid-session.
+
+## Running Tests
+
+Unit tests cover the data cache, opponent-adjusted ratings, distribution/probability, and market-edge logic in `R/`:
+
+```bash
+Rscript run_tests.R
+```
+
 ## App Overview for Beginners
 
 | Component                | Purpose                                                                 |
@@ -98,6 +116,11 @@ replace path/to with the actual folder path on your machine
 | ui_player.R              | Displays the detailed game-by-game stats for a player                   |
 | server_player_stats.R    | Filters, formats, and renders player stats using the nflreadr package   |
 | app.R                    | The main file that combines all parts and handles page navigation       |
+| R/data_pipeline.R        | Caches nflreadr pulls to `data_cache/` so the app doesn't re-download on every session |
+| R/opponent_adjustment.R  | Schedule-adjusted team offense/defense ratings                          |
+| R/distributions.R        | Turns a point prediction into a probability of clearing a line          |
+| R/market_edge.R          | Converts odds to implied probabilities and compares them to the model   |
+| etl/refresh_cache.R      | Standalone script to refresh `data_cache/` on a schedule                |
 
 ## 🧠 How It All Works (In Simple Terms)
 

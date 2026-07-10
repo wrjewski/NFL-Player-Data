@@ -5,8 +5,10 @@ output$player_stats_table <- DT::renderDataTable({
   # Make sure a player is selected before running the rest of the code
   req(selected_player())
 
-  # Load player stats for all seasons from 1999 through the current year
-  stats <- nflreadr::load_player_stats(
+  # Load player stats for all seasons from 1999 through the current year.
+  # Served from data_cache/ (see R/data_pipeline.R) instead of hitting
+  # nflverse on every session.
+  stats <- get_player_stats_cached(
     seasons = 1999:lubridate::year(Sys.Date())
   )
 

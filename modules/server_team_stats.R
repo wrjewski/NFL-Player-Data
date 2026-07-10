@@ -6,7 +6,7 @@ server_team_stats <- function(input, output, session) {
   team_stats_filtered <- eventReactive(input$go_show_team_stats, {
     req(input$team_stats_team, input$season_range, input$summary_type)
 
-    stats_all <- nflreadr::load_team_stats(
+    stats_all <- get_team_stats_cached(
       seasons = input$season_range[1]:input$season_range[2]
     )
 

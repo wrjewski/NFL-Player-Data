@@ -15,3 +15,7 @@ renv/staging/
 
 # OS/editor cruft
 .DS_Store
+
+# Local data cache populated by etl/refresh_cache.R (see R/data_pipeline.R) --
+# fetched data, not source; regenerate rather than commit.
+data_cache/

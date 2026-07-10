@@ -6,6 +6,7 @@ library(bslib)
 library(DT)
 library(lubridate)
 library(dplyr)
+library(tidyr)
 library(httr)
 library(jsonlite)
 library(purrr)
@@ -13,6 +14,12 @@ library(purrr)
 # Load local secrets (ODDS_API_KEY, etc.) from .Renviron if present.
 # .Renviron is git-ignored — see .Renviron.example for the template.
 if (file.exists(".Renviron")) readRenviron(".Renviron")
+
+# Data cache, opponent adjustment, distribution, and market-edge helpers.
+source("R/data_pipeline.R")
+source("R/opponent_adjustment.R")
+source("R/distributions.R")
+source("R/market_edge.R")
 
 # Load UI modules
 source("modules/ui_main_home.R")
@@ -52,25 +59,16 @@ server <- function(input, output, session) {
   })
 
   # --- Load NFL Data ---
-  sched_all <- nflreadr::load_schedules(seasons = 2025) %>%
+  # Reads from data_cache/ (populated by etl/refresh_cache.R) instead of
+  # hitting nflverse on every session start. See R/data_pipeline.R.
+  sched_all <- get_schedules_cached(seasons = 2025) %>%
     distinct(game_id, .keep_all = TRUE)
-  team_stats_all <- nflreadr::load_team_stats(seasons = 2025)
+  team_stats_all <- get_team_stats_cached(seasons = 2025)
 
-  team_summary <- team_stats_all %>%
-    group_by(team, season) %>%
-    summarise(
-      avg_passing_yards = mean(passing_yards, na.rm = TRUE),
-      avg_rushing_yards = mean(rushing_yards, na.rm = TRUE),
-      avg_completions = mean(completions, na.rm = TRUE),
-      avg_attempts = mean(attempts, na.rm = TRUE),
-      avg_def_tackles = mean(def_tackles_solo + def_tackles_with_assist, na.rm = TRUE),
-      avg_def_sacks = mean(def_sacks, na.rm = TRUE),
-      avg_def_interceptions = mean(def_interceptions, na.rm = TRUE),
-      avg_passes_defended = mean(def_pass_defended, na.rm = TRUE),
-      avg_total_offense = avg_passing_yards + avg_rushing_yards,
-      avg_total_defense = avg_def_tackles + avg_def_sacks + avg_def_interceptions,
-      .groups = "drop"
-    )
+  # Opponent-adjusted offense/defense ratings (R/opponent_adjustment.R),
+  # replacing the old raw-average team_summary which conflated a team's
+  # strength with the strength of the schedule it happened to face.
+  team_summary <- compute_opponent_adjusted_ratings(team_stats_all)
 
   # --- Odds API setup ---
   # Key is read from the ODDS_API_KEY environment variable (see .Renviron.example).
@@ -85,15 +83,25 @@ server <- function(input, output, session) {
   odds_base <- "https://api.the-odds-api.com/v4"
 
   fetch_game_odds <- function() {
-    resp <- GET(
-      url = paste0(odds_base, "/sports/americanfootball_nfl/odds"),
-      query = list(
-        apiKey = odds_api_key,
-        regions = "us",
-        markets = "h2h,spreads,totals",
-        oddsFormat = "american"
+    resp <- tryCatch({
+      GET(
+        url = paste0(odds_base, "/sports/americanfootball_nfl/odds"),
+        query = list(
+          apiKey = odds_api_key,
+          regions = "us",
+          markets = "h2h,spreads,totals",
+          oddsFormat = "american"
+        )
       )
-    )
+    }, error = function(e) {
+      # A network failure here must not take down the whole app for every
+      # session -- degrade to "no odds data" instead.
+      warning("fetch_game_odds: request failed: ", conditionMessage(e))
+      NULL
+    })
+    if (is.null(resp)) {
+      return(list())
+    }
     if (status_code(resp) != 200) {
       warning("fetch_game_odds: HTTP status ", status_code(resp))
       return(list())
@@ -107,134 +115,6 @@ server <- function(input, output, session) {
       list()
     })
     parsed
-  }
-
-  fetch_prop_odds <- function(game_id) {
-    # First, we need to get the API event ID from our game ID
-    # The API uses different event IDs than our schedule data
-    # Let's get all available games from the API and match by teams
-    
-    # Get the game info from our schedule
-    game_info <- sched_all %>% filter(game_id == game_id)
-    if (nrow(game_info) == 0) {
-      return(list())
-    }
-    
-    # Get all available games from API
-    api_resp <- GET(
-      url = paste0(odds_base, "/sports/americanfootball_nfl/odds"),
-      query = list(
-        apiKey = odds_api_key,
-        regions = "us",
-        markets = "h2h",
-        oddsFormat = "american"
-      )
-    )
-    
-    if (status_code(api_resp) != 200) {
-      warning("fetch_prop_odds: Failed to get API games")
-      return(list())
-    }
-    
-    api_games <- fromJSON(content(api_resp, as = "text", encoding = "UTF-8"), flatten = TRUE)
-    
-    # Find matching game by team names (handle team name differences)
-    # Convert team abbreviations to full names for matching
-    team_name_map <- list(
-      "DAL" = "Dallas Cowboys", "PHI" = "Philadelphia Eagles", "KC" = "Kansas City Chiefs",
-      "LAC" = "Los Angeles Chargers", "ATL" = "Atlanta Falcons", "TB" = "Tampa Bay Buccaneers",
-      "CLE" = "Cleveland Browns", "CIN" = "Cincinnati Bengals", "IND" = "Indianapolis Colts",
-      "MIA" = "Miami Dolphins", "JAX" = "Jacksonville Jaguars", "CAR" = "Carolina Panthers",
-      "NE" = "New England Patriots", "LV" = "Las Vegas Raiders", "NO" = "New Orleans Saints",
-      "ARI" = "Arizona Cardinals", "NYJ" = "New York Jets", "PIT" = "Pittsburgh Steelers",
-      "WAS" = "Washington Commanders", "NYG" = "New York Giants", "GB" = "Green Bay Packers",
-      "SF" = "San Francisco 49ers", "LAR" = "Los Angeles Rams", "MIN" = "Minnesota Vikings",
-      "DET" = "Detroit Lions", "BUF" = "Buffalo Bills", "SEA" = "Seattle Seahawks",
-      "TEN" = "Tennessee Titans", "DEN" = "Denver Broncos"
-    )
-    
-    away_full <- team_name_map[[game_info$away_team[1]]] %||% game_info$away_team[1]
-    home_full <- team_name_map[[game_info$home_team[1]]] %||% game_info$home_team[1]
-    
-    matching_game <- api_games %>%
-      filter(
-        (away_team == away_full & home_team == home_full) |
-        (away_team == home_full & home_team == away_full)
-      )
-    
-    if (nrow(matching_game) == 0) {
-      warning("fetch_prop_odds: No matching game found in API for ", game_info$away_team[1], " vs ", game_info$home_team[1])
-      # Fallback: use any available game for demonstration
-      if (nrow(api_games) > 0) {
-        cat("Using fallback game for demonstration:", api_games$away_team[1], "vs", api_games$home_team[1], "\n")
-        matching_game <- api_games[1, ]
-      } else {
-        return(list())
-      }
-    }
-    
-    api_event_id <- matching_game$id[1]
-    cat("Found API event ID:", api_event_id, "for game", game_info$away_team[1], "vs", game_info$home_team[1], "\n")
-    
-    # Now get player props for the API event ID
-    # Use the correct market names that we know work
-    available_markets <- c("player_receptions", "player_pass_yds", "player_rush_yds")
-    
-    all_props <- list()
-    
-    for (market in available_markets) {
-      resp <- GET(
-        url = paste0(odds_base, "/sports/americanfootball_nfl/events/", api_event_id, "/odds"),
-        query = list(
-          apiKey = odds_api_key,
-          regions = "us",
-          markets = market,
-          oddsFormat = "american"
-        )
-      )
-      
-      if (status_code(resp) == 200) {
-    txt <- content(resp, as = "text", encoding = "UTF-8")
-    parsed <- tryCatch({
-      fromJSON(txt, flatten = FALSE)
-    }, error = function(e) {
-          warning("fetch_prop_odds: JSON parse error for ", market, ": ", e$message)
-      list()
-    })
-        
-        # Extract prop data from DraftKings (most reliable)
-        if (length(parsed) > 0 && "bookmakers" %in% names(parsed)) {
-          # Find DraftKings bookmaker (bookmakers is a list)
-          dk_idx <- which(sapply(parsed$bookmakers, function(x) x$key == "draftkings"))
-          if (length(dk_idx) > 0) {
-            dk_bookmaker <- parsed$bookmakers[[dk_idx]]
-            # Find the market we're looking for
-            market_idx <- which(sapply(dk_bookmaker$markets, function(x) x$key == market))
-            if (length(market_idx) > 0) {
-              market_data <- dk_bookmaker$markets[[market_idx]]$outcomes
-              if (length(market_data) > 0) {
-                # Convert to data frame and add market type
-                market_df <- do.call(rbind, lapply(market_data, function(x) {
-                  data.frame(
-                    player_name = x$description,
-                    prop_type = x$name,
-                    prop_line = x$point,
-                    price = x$price,
-                    market_type = market,
-                    stringsAsFactors = FALSE
-                  )
-                }))
-                all_props[[market]] <- market_df
-              }
-            }
-          }
-        }
-      } else {
-        warning("fetch_prop_odds: HTTP status ", status_code(resp), " for market ", market)
-      }
-    }
-    
-    all_props
   }
 
   game_odds_json <- fetch_game_odds()
@@ -300,24 +180,43 @@ server <- function(input, output, session) {
     games
   })
 
+  # Pulls a column's value if present, else NA -- lets us prefer the live
+  # odds-API price but fall back to the schedule's own line when the API
+  # is unavailable, without erroring on a missing column.
+  get_col_or_na <- function(row, col) if (col %in% names(row)) row[[col]] else NA_real_
+
   predict_game_edge <- function(row) {
-    # Check if we have team stats data
-    if (!all(c("avg_total_offense_home", "avg_total_defense_away", 
-               "avg_total_offense_away", "avg_total_defense_home") %in% names(row))) {
+    required_cols <- c("adj_offense_home", "adj_defense_away", "adj_offense_away", "adj_defense_home")
+    if (!all(required_cols %in% names(row)) || anyNA(row[required_cols])) {
       return("No Data")
     }
-    
-    pred_margin <- (row$avg_total_offense_home - row$avg_total_defense_away) -
-                   (row$avg_total_offense_away - row$avg_total_defense_home)
-    pred_total <- (row$avg_total_offense_home + row$avg_total_offense_away) / 2
-    
-    if (!is.na(row$spread_line) && abs(pred_margin - row$spread_line) > 3) {
-      return(paste0("Spread: ", if (pred_margin > row$spread_line) "Home" else "Away"))
+
+    # Opponent-adjusted margin (Item 3) converted to a win probability
+    # (Item 5), so it can be compared against the market's own implied
+    # probability instead of an arbitrary fixed point threshold.
+    pred_margin <- (row$adj_offense_home - row$adj_defense_away) -
+                   (row$adj_offense_away - row$adj_defense_home)
+    pred_total <- row$adj_offense_home + row$adj_offense_away
+    model_home_win_prob <- margin_to_win_prob(pred_margin)
+
+    home_ml <- dplyr::coalesce(get_col_or_na(row, "ml_home"), get_col_or_na(row, "home_moneyline"))
+    away_ml <- dplyr::coalesce(get_col_or_na(row, "ml_away"), get_col_or_na(row, "away_moneyline"))
+
+    if (!is.na(home_ml) && !is.na(away_ml)) {
+      market <- devig_two_way(american_to_prob(home_ml), american_to_prob(away_ml))
+      edge <- compute_edge(model_home_win_prob, market$prob_a, min_edge = 0.04)
+      if (edge$has_edge) {
+        favored <- if (edge$edge > 0) "Home ML" else "Away ML"
+        return(sprintf("%s (edge %+.0f%%)", favored, edge$edge * 100))
+      }
     }
-    if (!is.na(row$total_line) && abs(pred_total - row$total_line) > 7) {
-      return(paste0("O/U: ", if (pred_total > row$total_line) "Over" else "Under"))
+
+    total_line <- dplyr::coalesce(get_col_or_na(row, "total_line_odds"), get_col_or_na(row, "total_line"))
+    if (!is.na(total_line) && abs(pred_total - total_line) > 7) {
+      return(paste0("O/U: ", if (pred_total > total_line) "Over" else "Under"))
     }
-    return("ML")
+
+    return("No Edge")
   }
 
   output$upcoming_games_table <- DT::renderDataTable({
@@ -380,610 +279,78 @@ server <- function(input, output, session) {
     }
   })
 
-  # Load additional data sources for advanced predictions
-  load_advanced_data <- function(season = 2020:2025) {
-    tryCatch({
-      # Load play-by-play data for situational analysis
-      pbp_data <- nflreadr::load_pbp(seasons = season)
-      
-      # Load schedule for weather and game context
-      schedule_data <- nflreadr::load_schedules(seasons = season)
-      
-      # Load snap counts for role analysis
-      snap_data <- nflreadr::load_snap_counts(seasons = season)
-      
-      list(
-        pbp = pbp_data,
-        schedule = schedule_data,
-        snaps = snap_data
-      )
-    }, error = function(e) {
-      warning("Could not load advanced data: ", e$message)
-      list(pbp = NULL, schedule = NULL, snaps = NULL)
-    })
-  }
-  
-  # Get game context (weather, etc.)
-  get_game_context <- function(game_id, schedule_data) {
-    if (is.null(schedule_data)) return(NULL)
-    
-    game_info <- schedule_data %>% filter(game_id == !!game_id)
-    if (nrow(game_info) == 0) return(NULL)
-    
-    list(
-      weather = game_info$weather[1],
-      temperature = game_info$temp[1],
-      wind = game_info$wind[1],
-      dome = game_info$roof[1] == "dome"
-    )
-  }
-  
-  # Analyze player vs specific opponent
-  get_player_vs_opponent_stats <- function(player_id, opponent_team, historical_stats, seasons = 2025) {
-    if (is.null(historical_stats)) return(NULL)
-    
-    # This would require game-level data to match players vs specific opponents
-    # For now, return NULL but this could be enhanced with more detailed data
-    return(NULL)
-  }
-  
-  # Advanced prediction algorithms with ML-style feature engineering
-  predict_qb_passing_yards <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    # Use last 5 games for better trend analysis
-    recent_games <- player_stats %>% 
-      filter(season_type == "REG") %>%
-      arrange(desc(week)) %>% 
-      head(5)
-    
-    if (nrow(recent_games) == 0) return(200) # Default fallback
-    
-    # Calculate multiple base metrics
-    base_avg <- mean(recent_games$passing_yards, na.rm = TRUE)
-    recent_trend <- if (nrow(recent_games) >= 3) {
-      mean(recent_games$passing_yards[1:2], na.rm = TRUE) - mean(recent_games$passing_yards[3:5], na.rm = TRUE)
-    } else 0
-    
-    # Consistency factor (lower std dev = higher consistency)
-    consistency <- 1 - (sd(recent_games$passing_yards, na.rm = TRUE) / max(mean(recent_games$passing_yards, na.rm = TRUE), 1))
-    consistency <- max(0.5, min(1.2, consistency))
-    
-    # Team offensive strength vs opponent defensive weakness
-    team_pass_off <- team_stats$passing_yards_per_game[1] %||% 230
-    opp_pass_def <- opponent_stats$passing_yards_allowed_per_game[1] %||% 230
-    league_avg <- 230
-    
-    # Matchup factor: team offense vs opponent defense
-    matchup_factor <- (team_pass_off / league_avg) * (league_avg / opp_pass_def)
-    matchup_factor <- max(0.8, min(1.3, matchup_factor))
-    
-    # Home field advantage (slightly stronger)
-    home_factor <- ifelse(home_away == "home", 1.03, 0.97)
-    
-    # Game script factor (based on team records)
-    team_win_pct <- team_stats$win_percentage[1] %||% 0.5
-    opp_win_pct <- opponent_stats$win_percentage[1] %||% 0.5
-    game_script <- ifelse(team_win_pct < opp_win_pct, 1.05, 0.95) # Underdog throws more
-    
-    # Weather factor (if available)
-    weather_factor <- 1.0
-    if (!is.null(game_context) && !is.null(game_context$weather)) {
-      if (grepl("rain|snow|wind", tolower(game_context$weather))) {
-        weather_factor <- 0.9
-      }
-    }
-    
-    # Combine all factors
-    prediction <- base_avg * consistency * matchup_factor * home_factor * game_script * weather_factor
-    
-    # Apply trend adjustment (recent performance matters more)
-    prediction <- prediction + (recent_trend * 0.3)
-    
-    # Realistic bounds
-    prediction <- max(150, min(450, prediction))
-    
-    return(round(prediction, 1))
-  }
-  
-  predict_qb_rushing_yards <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    recent_games <- player_stats %>% arrange(desc(week)) %>% head(4)
-    base_avg <- mean(recent_games$rushing_yards, na.rm = TRUE)
-    
-    # If no recent data, use career average
-    if (is.na(base_avg) || base_avg == 0) {
-      base_avg <- mean(player_stats$rushing_yards, na.rm = TRUE)
-    }
-    
-    # Conservative team factors (max 15% adjustment)
-    team_rush_off <- team_stats$rushing_yards_per_game[1] %||% 120
-    league_avg <- 120
-    team_factor <- min(1.15, max(0.85, team_rush_off / league_avg))
-    
-    # Conservative opponent factor (max 10% adjustment)
-    opp_rush_def <- opponent_stats$rushing_yards_allowed_per_game[1] %||% 120
-    opp_factor <- min(1.1, max(0.9, league_avg / opp_rush_def))
-    
-    home_factor <- ifelse(home_away == "home", 1.01, 0.99)
-    
-    prediction <- base_avg * team_factor * opp_factor * home_factor
-    
-    # Apply realistic bounds for QB rushing yards (0-80 yards)
-    prediction <- max(0, min(80, prediction))
-    
-    return(round(prediction, 1))
-  }
-  
-  predict_qb_passing_tds <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    recent_games <- player_stats %>% arrange(desc(week)) %>% head(4)
-    base_avg <- mean(recent_games$passing_tds, na.rm = TRUE)
-    
-    # If no recent data, use career average
-    if (is.na(base_avg) || base_avg == 0) {
-      base_avg <- mean(player_stats$passing_tds, na.rm = TRUE)
-    }
-    
-    # Conservative team factor (max 15% adjustment)
-    team_pass_off <- team_stats$passing_yards_per_game[1] %||% 230
-    league_avg <- 230
-    team_factor <- min(1.15, max(0.85, team_pass_off / league_avg))
-    
-    # Conservative opponent factor (max 10% adjustment)
-    opp_pass_def <- opponent_stats$passing_yards_allowed_per_game[1] %||% 230
-    opp_factor <- min(1.1, max(0.9, league_avg / opp_pass_def))
-    
-    home_factor <- ifelse(home_away == "home", 1.05, 0.95)
-    
-    prediction <- base_avg * team_factor * opp_factor * home_factor
-    
-    # Apply realistic bounds for QB passing TDs (0-6 TDs)
-    prediction <- max(0, min(6, prediction))
-    
-    return(round(prediction, 1))
-  }
-  
-  predict_qb_passing_attempts <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    recent_games <- player_stats %>% arrange(desc(week)) %>% head(4)
-    base_avg <- mean(recent_games$attempts, na.rm = TRUE)
-    
-    # If no recent data, use career average
-    if (is.na(base_avg) || base_avg == 0) {
-      base_avg <- mean(player_stats$attempts, na.rm = TRUE)
-    }
-    
-    # Conservative game script factor (max 10% adjustment)
-    team_win_pct <- team_stats$win_percentage[1] %||% 0.5
-    opp_win_pct <- opponent_stats$win_percentage[1] %||% 0.5
-    game_script_factor <- ifelse(team_win_pct < opp_win_pct, 1.1, 0.9)
-    
-    # Conservative team factor (max 10% adjustment)
-    team_pass_att <- team_stats$pass_attempts_per_game[1] %||% 35
-    league_avg_att <- 35
-    team_factor <- min(1.1, max(0.9, team_pass_att / league_avg_att))
-    
-    home_factor <- ifelse(home_away == "home", 1.02, 0.98)
-    
-    prediction <- base_avg * game_script_factor * team_factor * home_factor
-    
-    # Apply realistic bounds for QB passing attempts (15-50 attempts)
-    prediction <- max(15, min(50, prediction))
-    
-    return(round(prediction, 1))
-  }
-  
-  predict_wr_receptions <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    # Use last 6 games for better role detection and trend analysis
-    recent_games <- player_stats %>% 
-      filter(season_type == "REG") %>%
-      arrange(desc(week)) %>% 
-      head(6)
-    
-    if (nrow(recent_games) == 0) return(1.0)
-    
-    # Calculate advanced metrics
-    recent_receptions <- recent_games$receptions
-    recent_targets <- recent_games$targets
-    recent_yards <- recent_games$receiving_yards
-    
-    # Games where player was active (had targets)
-    active_games <- recent_games[recent_targets > 0, ]
-    games_played <- nrow(active_games)
-    
-    if (games_played == 0) return(0.5)
-    
-    # Role detection based on multiple factors
-    avg_targets <- mean(active_games$targets, na.rm = TRUE)
-    avg_receptions <- mean(active_games$receptions, na.rm = TRUE)
-    target_share <- avg_targets / 35  # Assuming 35 team targets per game
-    catch_rate <- mean(active_games$receptions / active_games$targets, na.rm = TRUE)
-    
-    # Trend analysis (last 3 vs previous 3)
-    if (nrow(active_games) >= 4) {
-      last_half <- mean(active_games$receptions[1:min(3, nrow(active_games))], na.rm = TRUE)
-      first_half <- mean(active_games$receptions[max(1, nrow(active_games)-2):nrow(active_games)], na.rm = TRUE)
-      trend_factor <- ifelse(first_half > 0, last_half / first_half, 1)
-    } else {
-      trend_factor <- 1
-    }
-    
-    # Consistency factor (lower variance = higher consistency)
-    consistency <- 1 - (sd(active_games$receptions, na.rm = TRUE) / max(mean(active_games$receptions, na.rm = TRUE), 1))
-    consistency <- max(0.6, min(1.3, consistency))
-    
-    # Role-based base prediction
-    if (avg_targets >= 8) {
-      # WR1 - high target share
-      base_avg <- avg_receptions * 0.9
-    } else if (avg_targets >= 5) {
-      # WR2 - moderate target share
-      base_avg <- avg_receptions * 0.8
-    } else if (avg_targets >= 3) {
-      # WR3 - low target share
-      base_avg <- avg_receptions * 0.7
-    } else if (avg_targets >= 1) {
-      # WR4+ - very low target share
-      base_avg <- avg_receptions * 0.5
-    } else {
-      base_avg <- 0.5
-    }
-    
-    # Team passing volume factor
-    team_pass_att <- team_stats$pass_attempts_per_game[1] %||% 35
-    league_avg_att <- 35
-    team_volume_factor <- team_pass_att / league_avg_att
-    
-    # Opponent pass defense factor
-    opp_pass_def <- opponent_stats$passing_yards_allowed_per_game[1] %||% 230
-    league_avg_def <- 230
-    opp_def_factor <- league_avg_def / opp_pass_def
-    
-    # Target share adjustment based on team's passing tendencies
-    team_target_share <- target_share * team_volume_factor
-    
-    # Home field advantage
-    home_factor <- ifelse(home_away == "home", 1.02, 0.98)
-    
-    # Game script factor (teams behind throw more)
-    team_win_pct <- team_stats$win_percentage[1] %||% 0.5
-    opp_win_pct <- opponent_stats$win_percentage[1] %||% 0.5
-    game_script <- ifelse(team_win_pct < opp_win_pct, 1.03, 0.97)
-    
-    # Weather factor
-    weather_factor <- 1.0
-    if (!is.null(game_context) && !is.null(game_context$weather)) {
-      if (grepl("rain|snow|wind", tolower(game_context$weather))) {
-        weather_factor <- 0.95  # Slightly lower in bad weather
-      }
-    }
-    
-    # Combine all factors
-    prediction <- base_avg * consistency * team_target_share * opp_def_factor * 
-                  home_factor * game_script * weather_factor * trend_factor
-    
-    # Apply play probability (based on recent activity)
-    play_probability <- min(1.0, games_played / 6)
-    prediction <- prediction * play_probability
-    
-    # Realistic bounds
-    prediction <- max(0, min(10, prediction))
-    
-    return(round(prediction, 1))
-  }
-  
-  predict_wr_receiving_yards <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    # Use only regular season data from current season
-    recent_games <- player_stats %>% 
-      filter(season_type == "REG") %>%
-      arrange(desc(week)) %>% 
-      head(5)  # Look at last 5 games for better role detection
-    
-    # Calculate role-based prediction with trend analysis
-    recent_yards <- recent_games$receiving_yards
-    recent_targets <- recent_games$targets
-    games_played <- sum(recent_yards > 0 | recent_targets > 0, na.rm = TRUE)
-    avg_yards_when_active <- mean(recent_yards[recent_yards > 0], na.rm = TRUE)
-    avg_targets_when_active <- mean(recent_targets[recent_targets > 0], na.rm = TRUE)
-    
-    # Check for declining trend (last 2 games vs previous 3)
-    if (nrow(recent_games) >= 3) {
-      last_2_games <- mean(recent_games$receiving_yards[1:2], na.rm = TRUE)
-      prev_3_games <- mean(recent_games$receiving_yards[3:5], na.rm = TRUE)
-      trend_factor <- ifelse(prev_3_games > 0, last_2_games / prev_3_games, 1)
-    } else {
-      trend_factor <- 1
-    }
-    
-    # Determine role based on usage patterns with much stricter thresholds
-    if (games_played == 0) {
-      # Player hasn't played recently - very low prediction
-      base_avg <- 1
-    } else if (avg_targets_when_active > 10) {
-      # WR1 - high usage
-      base_avg <- avg_yards_when_active * 0.85 * trend_factor
-    } else if (avg_targets_when_active > 6) {
-      # WR2 - moderate usage
-      base_avg <- avg_yards_when_active * 0.75 * trend_factor
-    } else if (avg_targets_when_active > 3) {
-      # WR3 - low usage
-      base_avg <- avg_yards_when_active * 0.6 * trend_factor
-    } else if (avg_targets_when_active > 1) {
-      # WR4 - very low usage
-      base_avg <- avg_yards_when_active * 0.4 * trend_factor
-    } else {
-      # WR5 or rarely used - minimal usage
-      base_avg <- max(1, avg_yards_when_active * 0.2 * trend_factor)
-    }
-    
-    # Apply probability of playing (based on recent games played)
-    play_probability <- min(1.0, games_played / 5)
-    base_avg <- base_avg * play_probability
-    
-    # Apply additional penalty for players with declining usage
-    if (trend_factor < 0.5) {
-      base_avg <- base_avg * 0.6  # Additional 40% penalty for declining usage
-    }
-    
-    # Very conservative adjustments (max 3% total)
-    team_ypt <- team_stats$yards_per_attempt[1] %||% 7.5
-    league_avg_ypt <- 7.5
-    team_factor <- min(1.01, max(0.99, team_ypt / league_avg_ypt))
-    
-    home_factor <- ifelse(home_away == "home", 1.005, 0.995)
-    
-    prediction <- base_avg * team_factor * home_factor
-    
-    # Apply realistic bounds for WR receiving yards (0-100 yards)
-    prediction <- max(0, min(100, prediction))
-    
-    return(round(prediction, 1))
-  }
-  
-  predict_rb_rushing_attempts <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    # Use only regular season data from current season
-    recent_games <- player_stats %>% 
-      filter(season_type == "REG") %>%
-      arrange(desc(week)) %>% 
-      head(5)  # Look at last 5 games for better role detection
-    
-    # Calculate role-based prediction with trend analysis
-    recent_carries <- recent_games$carries
-    games_played <- sum(recent_carries > 0, na.rm = TRUE)
-    avg_carries_when_active <- mean(recent_carries[recent_carries > 0], na.rm = TRUE)
-    
-    # Check for declining trend (last 2 games vs previous 3)
-    if (nrow(recent_games) >= 3) {
-      last_2_games <- mean(recent_games$carries[1:2], na.rm = TRUE)
-      prev_3_games <- mean(recent_games$carries[3:5], na.rm = TRUE)
-      trend_factor <- ifelse(prev_3_games > 0, last_2_games / prev_3_games, 1)
-    } else {
-      trend_factor <- 1
-    }
-    
-    # Determine role based on usage patterns with much stricter thresholds
-    if (games_played == 0) {
-      # Player hasn't played recently - very low prediction
-      base_avg <- 0.5
-    } else if (avg_carries_when_active > 18) {
-      # Workhorse RB - high usage
-      base_avg <- avg_carries_when_active * 0.85 * trend_factor
-    } else if (avg_carries_when_active > 12) {
-      # Starting RB - moderate usage
-      base_avg <- avg_carries_when_active * 0.75 * trend_factor
-    } else if (avg_carries_when_active > 6) {
-      # Backup RB - low usage
-      base_avg <- avg_carries_when_active * 0.6 * trend_factor
-    } else if (avg_carries_when_active > 2) {
-      # Third string - very low usage
-      base_avg <- avg_carries_when_active * 0.4 * trend_factor
-    } else {
-      # Rarely used - minimal usage
-      base_avg <- max(0.5, avg_carries_when_active * 0.3 * trend_factor)
-    }
-    
-    # Apply probability of playing (based on recent games played)
-    play_probability <- min(1.0, games_played / 5)
-    base_avg <- base_avg * play_probability
-    
-    # Apply additional penalty for players with declining usage
-    if (trend_factor < 0.5) {
-      base_avg <- base_avg * 0.7  # Additional 30% penalty for declining usage
-    }
-    
-    # Very conservative adjustments (max 3% total)
-    team_rush_att <- team_stats$rush_attempts_per_game[1] %||% 25
-    league_avg_rush <- 25
-    team_factor <- min(1.01, max(0.99, team_rush_att / league_avg_rush))
-    
-    home_factor <- ifelse(home_away == "home", 1.005, 0.995)
-    
-    prediction <- base_avg * team_factor * home_factor
-    
-    # Apply realistic bounds for RB rushing attempts (0-15 attempts)
-    prediction <- max(0, min(15, prediction))
-    
-    return(round(prediction, 1))
-  }
-  
-  predict_rb_rushing_yards <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    # Use only regular season data from current season
-    recent_games <- player_stats %>% 
-      filter(season_type == "REG") %>%
-      arrange(desc(week)) %>% 
-      head(5)  # Look at last 5 games for better role detection
-    
-    # Calculate role-based prediction
-    recent_yards <- recent_games$rushing_yards
-    recent_carries <- recent_games$carries
-    games_played <- sum(recent_yards > 0 | recent_carries > 0, na.rm = TRUE)
-    avg_yards_when_active <- mean(recent_yards[recent_yards > 0], na.rm = TRUE)
-    avg_carries_when_active <- mean(recent_carries[recent_carries > 0], na.rm = TRUE)
-    
-    # Determine role based on usage patterns
-    if (games_played == 0) {
-      # Player hasn't played recently - very low prediction
-      base_avg <- 3
-    } else if (avg_carries_when_active > 15) {
-      # Workhorse RB - high usage
-      base_avg <- avg_yards_when_active * 0.9  # Slight regression
-    } else if (avg_carries_when_active > 8) {
-      # Starting RB - moderate usage
-      base_avg <- avg_yards_when_active * 0.8  # Some regression
-    } else if (avg_carries_when_active > 3) {
-      # Backup RB - low usage
-      base_avg <- avg_yards_when_active * 0.7  # More regression
-    } else {
-      # Third string/rarely used - very low usage
-      base_avg <- max(3, avg_yards_when_active * 0.5)  # Heavy regression
-    }
-    
-    # Apply probability of playing (based on recent games played)
-    play_probability <- min(1.0, games_played / 5)
-    base_avg <- base_avg * play_probability
-    
-    # Very conservative adjustments (max 5% total)
-    team_ypc <- team_stats$yards_per_carry[1] %||% 4.2
-    league_avg_ypc <- 4.2
-    team_factor <- min(1.02, max(0.98, team_ypc / league_avg_ypc))
-    
-    home_factor <- ifelse(home_away == "home", 1.01, 0.99)
-    
-    prediction <- base_avg * team_factor * home_factor
-    
-    # Apply realistic bounds for RB rushing yards (0-120 yards)
-    prediction <- max(0, min(120, prediction))
-    
-    return(round(prediction, 1))
-  }
-  
-  predict_rb_receiving_yards <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    recent_games <- player_stats %>% arrange(desc(week)) %>% head(4)
-    base_avg <- mean(recent_games$receiving_yards, na.rm = TRUE)
-    
-    # If no recent data, use career average
-    if (is.na(base_avg) || base_avg == 0) {
-      base_avg <- mean(player_stats$receiving_yards, na.rm = TRUE)
-    }
-    
-    # Conservative target share factor (max 20% adjustment)
-    target_share <- mean(recent_games$targets, na.rm = TRUE) / 25  # Use league average
-    target_share <- ifelse(is.na(target_share), 0.08, target_share)
-    target_factor <- min(1.2, max(0.8, target_share / 0.08))
-    
-    # Conservative team factor (max 10% adjustment)
-    team_pass_att <- team_stats$pass_attempts_per_game[1] %||% 35
-    team_factor <- min(1.1, max(0.9, team_pass_att / 35))
-    
-    home_factor <- ifelse(home_away == "home", 1.02, 0.98)
-    
-    prediction <- base_avg * target_factor * team_factor * home_factor
-    
-    # Apply realistic bounds for RB receiving yards (0-100 yards)
-    prediction <- max(0, min(100, prediction))
-    
-    return(round(prediction, 1))
-  }
-  
-  predict_te_receptions <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    recent_games <- player_stats %>% arrange(desc(week)) %>% head(4)
-    base_avg <- mean(recent_games$receptions, na.rm = TRUE)
-    
-    # If no recent data, use career average
-    if (is.na(base_avg) || base_avg == 0) {
-      base_avg <- mean(player_stats$receptions, na.rm = TRUE)
-    }
-    
-    # Conservative target share factor (max 20% adjustment)
-    target_share <- mean(recent_games$targets, na.rm = TRUE) / 25  # Use league average
-    target_share <- ifelse(is.na(target_share), 0.12, target_share)
-    target_factor <- min(1.2, max(0.8, target_share / 0.12))
-    
-    # Conservative team factor (max 10% adjustment)
-    team_pass_att <- team_stats$pass_attempts_per_game[1] %||% 35
-    team_factor <- min(1.1, max(0.9, team_pass_att / 35))
-    
-    home_factor <- ifelse(home_away == "home", 1.02, 0.98)
-    
-    prediction <- base_avg * target_factor * team_factor * home_factor
-    
-    # Apply realistic bounds for TE receptions (0-12 receptions)
-    prediction <- max(0, min(12, prediction))
-    
-    return(round(prediction, 1))
-  }
-  
-  predict_te_receiving_yards <- function(player_stats, team_stats, opponent_stats, home_away, game_context = NULL) {
-    recent_games <- player_stats %>% arrange(desc(week)) %>% head(4)
-    base_avg <- mean(recent_games$receiving_yards, na.rm = TRUE)
-    
-    # If no recent data, use career average
-    if (is.na(base_avg) || base_avg == 0) {
-      base_avg <- mean(player_stats$receiving_yards, na.rm = TRUE)
-    }
-    
-    # Conservative yards per target factor (max 15% adjustment)
-    ypt <- mean(recent_games$receiving_yards / recent_games$targets, na.rm = TRUE)
-    ypt <- ifelse(is.na(ypt), 7.5, ypt)
-    ypt_factor <- min(1.15, max(0.85, ypt / 7.5))
-    
-    # Conservative team factor (max 10% adjustment)
-    team_ypt <- team_stats$yards_per_attempt[1] %||% 7.5
-    team_factor <- min(1.1, max(0.9, team_ypt / 7.5))
-    
-    home_factor <- ifelse(home_away == "home", 1.02, 0.98)
-    
-    prediction <- base_avg * ypt_factor * team_factor * home_factor
-    
-    # Apply realistic bounds for TE receiving yards (0-150 yards)
-    prediction <- max(0, min(150, prediction))
-    
-    return(round(prediction, 1))
-  }
-
   upcoming_player_props <- reactive({
     req(input$prop_week, input$prop_matchup)
-    
+
     if (input$prop_matchup == "none") {
       return(tibble())
     }
-    
+
     # Get the game info from the schedule data for the selected matchup
     selected_game <- sched_all %>% filter(game_id == input$prop_matchup)
 
     if (nrow(selected_game) == 0) {
         return(tibble())
     }
-    
+
     week_num <- selected_game$week[1]
     home_team <- selected_game$home_team[1]
     away_team <- selected_game$away_team[1]
-    
-    # Load current rosters
-    current_rosters <- nflreadr::load_rosters(seasons = 2025)
-    
+
+    # Load current rosters (Item 1: served from data_cache/, not live network)
+    current_rosters <- get_rosters_cached(seasons = 2025)
+
     # Get current rosters for both teams
     home_players <- current_rosters %>%
       filter(team == home_team, position %in% c("QB", "RB", "WR", "TE")) %>%
       select(player_name = full_name, position, team)
-    
+
     away_players <- current_rosters %>%
       filter(team == away_team, position %in% c("QB", "RB", "WR", "TE")) %>%
       select(player_name = full_name, position, team)
-    
+
     all_players <- bind_rows(home_players, away_players)
-    
+
     if (nrow(all_players) == 0) {
       return(tibble())
     }
-    
+
     # Get recent stats for trend analysis
-    recent_stats <- nflreadr::load_player_stats(seasons = 2025) %>%
+    recent_stats <- get_player_stats_cached(seasons = 2025) %>%
       filter(week <= week_num, week >= max(1, week_num - 3)) %>%
-      select(player_name, position, passing_yards, rushing_yards, receiving_yards, receptions, 
+      select(player_name, position, passing_yards, rushing_yards, receiving_yards, receptions,
              passing_tds, rushing_tds, receiving_tds)
-    
-    # Generate simple prop predictions based on recent averages
+
+    # Item 2: injury status discounts predictions for players who are
+    # doubtful/out instead of silently ignoring availability. Wrapped in
+    # tryCatch so an unexpected schema/network hiccup degrades to "no
+    # adjustment" rather than breaking the whole props table.
+    injury_status <- tryCatch({
+      get_injuries_cached(seasons = 2025) %>%
+        filter(week == week_num) %>%
+        select(player_name = full_name, team, report_status) %>%
+        distinct(player_name, team, .keep_all = TRUE)
+    }, error = function(e) {
+      tibble(player_name = character(), team = character(), report_status = character())
+    })
+
+    # Item 2: Next Gen Stats completion % above expectation refines the QB
+    # yardage projection beyond a raw box-score average.
+    qb_cpoe <- tryCatch({
+      get_nextgen_stats_cached(seasons = 2025, stat_type = "passing") %>%
+        filter(week <= week_num, week >= max(1, week_num - 3)) %>%
+        group_by(player_name = player_display_name) %>%
+        summarise(avg_cpoe = mean(completion_percentage_above_expectation, na.rm = TRUE), .groups = "drop")
+    }, error = function(e) {
+      tibble(player_name = character(), avg_cpoe = numeric())
+    })
+
+    # Generate prop predictions based on recent averages, adjusted for
+    # availability and (for QBs) recent passing accuracy trend.
     prop_predictions <- all_players %>%
       left_join(recent_stats, by = c("player_name", "position")) %>%
       group_by(player_name, team, position) %>%
-            summarise(
+      summarise(
         avg_passing = mean(passing_yards, na.rm = TRUE),
         avg_rushing = mean(rushing_yards, na.rm = TRUE),
         avg_receiving = mean(receiving_yards, na.rm = TRUE),
@@ -992,18 +359,32 @@ server <- function(input, output, session) {
         avg_rushing_tds = mean(rushing_tds, na.rm = TRUE),
         avg_receiving_tds = mean(receiving_tds, na.rm = TRUE),
         games_played = n(),
-              .groups = "drop"
-            ) %>%
+        .groups = "drop"
+      ) %>%
       filter(games_played > 0) %>%
+      left_join(injury_status, by = c("player_name", "team")) %>%
+      left_join(qb_cpoe, by = "player_name") %>%
       rowwise() %>%
-            mutate(
-        passing_yards_pred = if (position == "QB" && !is.na(avg_passing)) round(avg_passing) else NA,
-        rushing_yards_pred = if (position %in% c("QB", "RB") && !is.na(avg_rushing)) round(avg_rushing) else NA,
-        receiving_yards_pred = if (position %in% c("WR", "TE", "RB") && !is.na(avg_receiving)) round(avg_receiving) else NA,
-        receptions_pred = if (position %in% c("WR", "TE", "RB") && !is.na(avg_receptions)) round(avg_receptions) else NA,
-        passing_tds_pred = if (position == "QB" && !is.na(avg_passing_tds)) round(avg_passing_tds * 10) / 10 else NA,
-        rushing_tds_pred = if (position %in% c("QB", "RB") && !is.na(avg_rushing_tds)) round(avg_rushing_tds * 10) / 10 else NA,
-        receiving_tds_pred = if (position %in% c("WR", "TE", "RB") && !is.na(avg_receiving_tds)) round(avg_receiving_tds * 10) / 10 else NA
+      mutate(
+        cpoe_factor = if (position == "QB" && !is.na(avg_cpoe)) {
+          max(0.9, min(1.1, 1 + (avg_cpoe / 100)))
+        } else {
+          1
+        },
+        availability_factor = dplyr::case_when(
+          is.na(report_status) ~ 1,
+          report_status == "Out" ~ 0,
+          report_status == "Doubtful" ~ 0.25,
+          report_status == "Questionable" ~ 0.85,
+          TRUE ~ 1
+        ),
+        passing_yards_pred = if (position == "QB" && !is.na(avg_passing)) round(avg_passing * cpoe_factor * availability_factor) else NA,
+        rushing_yards_pred = if (position %in% c("QB", "RB") && !is.na(avg_rushing)) round(avg_rushing * availability_factor) else NA,
+        receiving_yards_pred = if (position %in% c("WR", "TE", "RB") && !is.na(avg_receiving)) round(avg_receiving * availability_factor) else NA,
+        receptions_pred = if (position %in% c("WR", "TE", "RB") && !is.na(avg_receptions)) round(avg_receptions * availability_factor) else NA,
+        passing_tds_pred = if (position == "QB" && !is.na(avg_passing_tds)) round(avg_passing_tds * availability_factor * 10) / 10 else NA,
+        rushing_tds_pred = if (position %in% c("QB", "RB") && !is.na(avg_rushing_tds)) round(avg_rushing_tds * availability_factor * 10) / 10 else NA,
+        receiving_tds_pred = if (position %in% c("WR", "TE", "RB") && !is.na(avg_receiving_tds)) round(avg_receiving_tds * availability_factor * 10) / 10 else NA
       ) %>%
       ungroup() %>%
       pivot_longer(
@@ -1014,25 +395,42 @@ server <- function(input, output, session) {
       ) %>%
       filter(!is.na(prediction)) %>%
       mutate(
+        stat_family = if_else(grepl("tds", prop_type), "count", "yardage"),
         prop_type = case_when(
           prop_type == "passing_yards_pred" ~ "Passing Yards",
-          prop_type == "rushing_yards_pred" ~ "Rushing Yards", 
+          prop_type == "rushing_yards_pred" ~ "Rushing Yards",
           prop_type == "receiving_yards_pred" ~ "Receiving Yards",
           prop_type == "receptions_pred" ~ "Receptions",
           prop_type == "passing_tds_pred" ~ "Passing TDs",
           prop_type == "rushing_tds_pred" ~ "Rushing TDs",
           prop_type == "receiving_tds_pred" ~ "Receiving TDs"
         ),
-        prop_line = prediction,
+        # Item 4: the "line" a book would post is usually just under the
+        # median prediction (so it isn't a push); report the model's
+        # probability of clearing it instead of only a bare point estimate.
+        model_line = if_else(stat_family == "count",
+                              pmax(0, prediction - 0.5),
+                              pmax(0, round(prediction * 2) / 2 - 0.5))
+      ) %>%
+      rowwise() %>%
+      mutate(
+        prob_over = if (stat_family == "count") {
+          prob_over_count(prediction, model_line)
+        } else {
+          prob_over_yardage(prediction, model_line)
+        }
+      ) %>%
+      ungroup() %>%
+      mutate(
         confidence = case_when(
           games_played >= 3 ~ "High",
-          games_played >= 2 ~ "Medium", 
+          games_played >= 2 ~ "Medium",
           TRUE ~ "Low"
         )
       ) %>%
-      select(player_name, team, position, prop_type, prop_line, confidence) %>%
+      select(player_name, team, position, prop_type, prediction, model_line, prob_over, confidence) %>%
       arrange(team, position, player_name, prop_type)
-    
+
     return(prop_predictions)
   })
 
@@ -1051,7 +449,10 @@ server <- function(input, output, session) {
         }
         return(DT::datatable(data.frame(Message = message), rownames = FALSE))
       }
-    DT::datatable(df, options = list(scrollX = TRUE), rownames = FALSE)
+    disp <- df
+    names(disp) <- gsub("_", " ", tools::toTitleCase(names(disp)))
+    DT::datatable(disp, options = list(scrollX = TRUE), rownames = FALSE) %>%
+      DT::formatPercentage("Prob Over", digits = 0)
     }, error = function(e) {
       # Return empty table with error message
       DT::datatable(data.frame(Error = paste("Unable to load player props data:", e$message)), rownames = FALSE)
@@ -1060,15 +461,18 @@ server <- function(input, output, session) {
 
   # --- Player Trends Analysis ---
   
-  # Load historical data for trends analysis
+  # Load historical data for trends analysis. This is called multiple times
+  # per week-selection (once for matchup choices, once for trend content);
+  # routing it through the cache (Item 1) means only the first call per
+  # cache lifetime actually hits the network.
   load_trends_data <- function(seasons = 2020:2025) {
     tryCatch({
       # Load historical data for trend analysis (2020-2025)
-      player_stats <- nflreadr::load_player_stats(seasons = seasons)
-      schedules <- nflreadr::load_schedules(seasons = seasons)
-      
+      player_stats <- get_player_stats_cached(seasons = seasons)
+      schedules <- get_schedules_cached(seasons = seasons)
+
       # Load 2025 rosters for current season
-      rosters <- nflreadr::load_rosters(seasons = 2025)
+      rosters <- get_rosters_cached(seasons = 2025)
       
       # Get unique player info from rosters
       roster_info <- rosters %>%
@@ -1468,7 +872,7 @@ server <- function(input, output, session) {
   observeEvent(input$back_position, current_page("position"))
 
   observe({
-    teams <- nflreadr::load_teams()
+    teams <- get_cached_data("teams", function() nflreadr::load_teams())
     lapply(teams$team_abbr, function(tb) {
       observeEvent(input[[paste0("team_", tb)]], {
         selected_team(tb)
@@ -1488,7 +892,7 @@ server <- function(input, output, session) {
   })
 
   observe({
-    rosters <- nflreadr::load_rosters()
+    rosters <- get_rosters_cached(seasons = 2025)
     lapply(rosters$gsis_id, function(pid) {
       observeEvent(input[[paste0("player_", pid)]], {
         selected_player(pid)
