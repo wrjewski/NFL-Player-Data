@@ -1,0 +1,8 @@
+{
+    "cSpell.words": [
+        "bootswatch",   // A theme library used for styling in Shiny
+        "bslib",        // R package for Bootstrap themes (like Minty)
+        "nflreadr",     // R package for NFL stats data
+        "nolint"        // Used to suppress linter warnings (not a typo)
+    ]
+}

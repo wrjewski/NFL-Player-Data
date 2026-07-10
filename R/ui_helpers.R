@@ -1,0 +1,1 @@
+# nolint: trailing_blank_lines_linter.
