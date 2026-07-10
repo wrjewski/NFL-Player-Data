@@ -58,6 +58,21 @@ Open RStudio and run this once:
 ```r
 install.packages(c("shiny", "nflreadr", "bslib", "DT", "lubridate"))
 
+### ✅ 2. Set Up Your Odds API Key
+
+The Sports Betting tab pulls live odds from [the-odds-api.com](https://the-odds-api.com/), which requires an API key. The key is **not** stored in this repo — you provide your own locally.
+
+1. Get a free key at https://the-odds-api.com/
+2. Copy the example env file:
+   ```bash
+   cp .Renviron.example .Renviron
+   ```
+3. Open `.Renviron` and paste your key:
+   ```
+   ODDS_API_KEY=your_actual_key_here
+   ```
+4. `.Renviron` is listed in `.gitignore`, so it will never be committed. The app reads it automatically on startup. If it's missing, the app still runs — the betting/odds features just show no data.
+
 ## Download the Project
 
 1. Download the project folder (NFL-Player-Data) as a .zip file and unzip it

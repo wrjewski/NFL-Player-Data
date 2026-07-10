@@ -1,0 +1,17 @@
+# Secrets / local environment
+.Renviron
+.env
+
+# R session/history artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# renv
+renv/library/
+renv/local/
+renv/staging/
+
+# OS/editor cruft
+.DS_Store

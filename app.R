@@ -10,6 +10,10 @@ library(httr)
 library(jsonlite)
 library(purrr)
 
+# Load local secrets (ODDS_API_KEY, etc.) from .Renviron if present.
+# .Renviron is git-ignored — see .Renviron.example for the template.
+if (file.exists(".Renviron")) readRenviron(".Renviron")
+
 # Load UI modules
 source("modules/ui_main_home.R")
 source("modules/ui_team_stats.R")
@@ -69,7 +73,15 @@ server <- function(input, output, session) {
     )
 
   # --- Odds API setup ---
-  odds_api_key <- "***REMOVED-SEE-ENV-VAR***"
+  # Key is read from the ODDS_API_KEY environment variable (see .Renviron.example).
+  # Never hardcode API keys in source — .Renviron is git-ignored for this reason.
+  odds_api_key <- Sys.getenv("ODDS_API_KEY")
+  if (identical(odds_api_key, "")) {
+    warning(
+      "ODDS_API_KEY is not set. Copy .Renviron.example to .Renviron and add your key. ",
+      "Odds/betting features will be unavailable until this is set."
+    )
+  }
   odds_base <- "https://api.the-odds-api.com/v4"
 
   fetch_game_odds <- function() {

@@ -1,0 +1,8 @@
+# Copy this file to .Renviron (same directory as app.R) and fill in your real key.
+# .Renviron is git-ignored and will never be committed.
+#
+#   cp .Renviron.example .Renviron
+#
+# Get a key at https://the-odds-api.com/
+
+ODDS_API_KEY=your_odds_api_key_here

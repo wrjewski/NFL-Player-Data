@@ -2,7 +2,12 @@
 library(httr)
 library(jsonlite)
 
-odds_api_key <- "***REMOVED-SEE-ENV-VAR***"
+# Key is read from the ODDS_API_KEY environment variable (see .Renviron.example).
+if (file.exists(".Renviron")) readRenviron(".Renviron")
+odds_api_key <- Sys.getenv("ODDS_API_KEY")
+if (identical(odds_api_key, "")) {
+  stop("ODDS_API_KEY is not set. Copy .Renviron.example to .Renviron and add your key.")
+}
 odds_base <- "https://api.the-odds-api.com/v4"
 
 # Test the main odds endpoint
