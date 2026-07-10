@@ -324,9 +324,11 @@ server <- function(input, output, session) {
       return(tibble())
     }
 
-    # Get recent stats for trend analysis
+    # Get recent stats for trend analysis -- strictly *before* the target
+    # week. Using week <= week_num here would leak that week's own result
+    # into the "recent form" average used to predict it.
     recent_stats <- get_player_stats_cached(seasons = current_season) %>%
-      filter(week <= week_num, week >= max(1, week_num - 3)) %>%
+      filter(week < week_num, week >= max(1, week_num - 4)) %>%
       select(player_name, position, passing_yards, rushing_yards, receiving_yards, receptions,
              passing_tds, rushing_tds, receiving_tds)
 
@@ -347,7 +349,7 @@ server <- function(input, output, session) {
     # yardage projection beyond a raw box-score average.
     qb_cpoe <- tryCatch({
       get_nextgen_stats_cached(seasons = current_season, stat_type = "passing") %>%
-        filter(week <= week_num, week >= max(1, week_num - 3)) %>%
+        filter(week < week_num, week >= max(1, week_num - 4)) %>%
         group_by(player_name = player_display_name) %>%
         summarise(avg_cpoe = mean(completion_percentage_above_expectation, na.rm = TRUE), .groups = "drop")
     }, error = function(e) {

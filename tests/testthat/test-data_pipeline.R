@@ -51,6 +51,35 @@ test_that("get_cached_data honors force_refresh even when cache is fresh", {
   expect_equal(call_count, 2)
 })
 
+test_that("get_cached_data falls back to a stale cache when refresh fails", {
+  cache_dir <- tempfile("cache")
+  on.exit(unlink(cache_dir, recursive = TRUE), add = TRUE)
+
+  ok_fetch <- function() data.frame(x = "good data")
+  get_cached_data("k", ok_fetch, cache_dir = cache_dir)
+
+  cache_file <- file.path(cache_dir, "k.rds")
+  Sys.setFileTime(cache_file, Sys.time() - as.difftime(48, units = "hours"))
+
+  failing_fetch <- function() stop("network is down")
+  result <- expect_warning(
+    get_cached_data("k", failing_fetch, cache_dir = cache_dir, max_age_hours = 12),
+    "serving stale cache"
+  )
+  expect_equal(result$x, "good data")
+})
+
+test_that("get_cached_data propagates the error when there is no cache to fall back on", {
+  cache_dir <- tempfile("cache")
+  on.exit(unlink(cache_dir, recursive = TRUE), add = TRUE)
+  failing_fetch <- function() stop("network is down")
+
+  expect_error(
+    get_cached_data("k", failing_fetch, cache_dir = cache_dir),
+    "network is down"
+  )
+})
+
 test_that("season_key produces a stable, readable cache key component", {
   expect_equal(season_key(2020:2024), "2020-2024")
   expect_equal(season_key(2025), "2025-2025")

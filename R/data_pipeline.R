@@ -17,6 +17,9 @@ cache_is_fresh <- function(cache_file, max_age_hours) {
 
 # Get data from cache, or fetch via fetch_fn() and populate the cache if
 # stale/missing. fetch_fn is injected so this is testable without network.
+# If a refresh fetch fails (network down, upstream outage) and a stale
+# cache file exists, serves that instead of crashing the caller -- old data
+# beats no data. Only propagates the error when there's no cache at all.
 get_cached_data <- function(cache_key, fetch_fn, cache_dir = "data_cache",
                              max_age_hours = 12, force_refresh = FALSE) {
   if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
@@ -26,9 +29,23 @@ get_cached_data <- function(cache_key, fetch_fn, cache_dir = "data_cache",
     return(readRDS(cache_file))
   }
 
-  data <- fetch_fn()
-  saveRDS(data, cache_file)
-  data
+  fetch_result <- tryCatch(
+    list(ok = TRUE, data = fetch_fn()),
+    error = function(e) list(ok = FALSE, error = e)
+  )
+
+  if (fetch_result$ok) {
+    saveRDS(fetch_result$data, cache_file)
+    return(fetch_result$data)
+  }
+
+  if (file.exists(cache_file)) {
+    warning("get_cached_data: refresh failed for '", cache_key,
+            "', serving stale cache instead: ", conditionMessage(fetch_result$error))
+    return(readRDS(cache_file))
+  }
+
+  stop(fetch_result$error)
 }
 
 season_key <- function(seasons) paste(range(seasons), collapse = "-")
